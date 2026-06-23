@@ -5,7 +5,7 @@
 #include <vector>
 
 //==============================================================================
-// 1. Data Model (Now with XML Serialization for saving/loading)
+// 1. Data Model
 //==============================================================================
 struct Song
 {
@@ -15,7 +15,6 @@ struct Song
     juce::String notes { "Intro: \nVerse: \nChorus: " };
     juce::Colour color { 0xffff7b00 };
 
-    // Convert Song to XML
     juce::XmlElement* toXml() const
     {
         auto* xml = new juce::XmlElement("SONG");
@@ -27,7 +26,6 @@ struct Song
         return xml;
     }
 
-    // Create Song from XML
     static Song fromXml(juce::XmlElement* xml)
     {
         Song s;
@@ -43,7 +41,7 @@ struct Song
 };
 
 //==============================================================================
-// 2. The "Elevation / Ableton" Style Click Synth
+// 2. The Click Synth
 //==============================================================================
 class WorshipClickSynth
 {
@@ -83,7 +81,7 @@ private:
 };
 
 //==============================================================================
-// 3. UI Components (Tiles & Rows)
+// 3. UI Components
 //==============================================================================
 class StageTile : public juce::Component
 {
@@ -115,9 +113,10 @@ public:
 
         g.setColour(juce::Colours::grey);
         g.setFont(17.0f);
+
+        // Using the safe Unicode bullet point (0x2022) to prevent Windows encoding errors
         g.drawText(juce::String(song.bpm) + " BPM   " + juce::String::charToString(0x2022) + "   " + juce::String(song.ts) + "/4",
                    getLocalBounds().reduced(15, 10).removeFromBottom(25), juce::Justification::centredLeft);
-
     }
 
     void mouseDown(const juce::MouseEvent&) override { onClick(index); }
@@ -137,7 +136,6 @@ private:
 class EditorRow : public juce::Component
 {
 public:
-    // Added an onEdit callback so we know when to trigger a hard drive save
     EditorRow(Song& s, std::function<void()> onDel, std::function<void()> onEdit)
         : song(s), onDelete(std::move(onDel)), onDataChanged(std::move(onEdit))
     {
@@ -224,7 +222,6 @@ private:
             default: song.color = juce::Colour(0xffff7b00); break;
         }
 
-        // Notify parent to trigger a background save
         if (onDataChanged) onDataChanged();
     }
 };
@@ -232,7 +229,8 @@ private:
 //==============================================================================
 // 4. Main Application Application
 //==============================================================================
-class MainComponent : public juce::AudioAppComponent, public juce::Timer
+// Note: We now inherit from juce::ChangeListener to track Audio Device routing!
+class MainComponent : public juce::AudioAppComponent, public juce::Timer, public juce::ChangeListener
 {
 public:
     MainComponent()
@@ -240,7 +238,7 @@ public:
         juce::LookAndFeel::getDefaultLookAndFeel().setDefaultSansSerifTypefaceName("Roboto");
         setSize(900, 600);
 
-        // --- Setup Application Storage (Local Machine Saves) ---
+        // --- Setup Application Storage ---
         juce::PropertiesFile::Options storageOptions;
         storageOptions.applicationName     = "Setlist Metronome";
         storageOptions.folderName          = "SetlistMetronome";
@@ -248,10 +246,10 @@ public:
         storageOptions.osxLibrarySubFolder = "Application Support";
         appProperties.setStorageParameters(storageOptions);
 
-        // --- Load Saved Data ---
         auto* settings = appProperties.getUserSettings();
-        std::unique_ptr<juce::XmlElement> savedData(settings->getXmlValue("Setlist"));
 
+        // 1. Load Saved Setlist
+        std::unique_ptr<juce::XmlElement> savedData(settings->getXmlValue("Setlist"));
         if (savedData != nullptr && savedData->hasTagName("SETLIST"))
         {
             for (auto* child : savedData->getChildIterator())
@@ -260,8 +258,6 @@ public:
                     setlist.push_back(Song::fromXml(child));
             }
         }
-
-        // If it's a fresh install for your friend, give them the default data
         if (setlist.empty())
         {
             setlist.push_back({"Opener", 120.0, 4, "Key: G\n\nIntro: G | C | Em | D\n\nVerse 1:\nKeep it driving on the floor tom.", juce::Colour(0xffff7b00)});
@@ -269,16 +265,25 @@ public:
             triggerSave();
         }
 
+        // 2. Load Saved Audio Interface / USB Codec
+        std::unique_ptr<juce::XmlElement> audioState(settings->getXmlValue("AudioDeviceState"));
+
+        // --- Start Audio Engine using saved settings! ---
+        setAudioChannels(0, 2, audioState.get());
+        deviceManager.addChangeListener(this); // Listen for when user changes USB Codec
+
         // --- Top Navigation Bar ---
         navStageBtn.setButtonText("STAGE VIEW");
         navEditBtn.setButtonText("EDIT SETLIST");
-        styleNavBtn(navStageBtn, true);
-        styleNavBtn(navEditBtn, false);
+        navSettingsBtn.setButtonText("SETTINGS"); // New Settings Tab
 
-        navStageBtn.onClick = [this] { switchView(true); };
-        navEditBtn.onClick = [this] { switchView(false); };
+        navStageBtn.onClick = [this] { switchView(0); };
+        navEditBtn.onClick = [this] { switchView(1); };
+        navSettingsBtn.onClick = [this] { switchView(2); };
+
         addAndMakeVisible(navStageBtn);
         addAndMakeVisible(navEditBtn);
+        addAndMakeVisible(navSettingsBtn);
 
         // --- Stage View Components ---
         addAndMakeVisible(stageViewport);
@@ -298,7 +303,7 @@ public:
         notesDisplay.onTextChange = [this] {
             if (activeSongIndex >= 0 && activeSongIndex < setlist.size()) {
                 setlist[activeSongIndex].notes = notesDisplay.getText();
-                triggerSave(); // Start debounce timer for typing
+                triggerSave();
             }
         };
 
@@ -318,22 +323,48 @@ public:
         };
         addChildComponent(addSongBtn);
 
+        // --- Settings View Components (Audio Routing) ---
+        audioSetupComp = std::make_unique<juce::AudioDeviceSelectorComponent>(
+            deviceManager,
+            0, 0, // min/max inputs (we don't need mics)
+            0, 2, // min/max outputs (stereo out)
+            false, false, false, false); // No midi, simple view
+        addChildComponent(audioSetupComp.get());
+
         activeSongIndex = 0;
         if (!setlist.empty())
             notesDisplay.setText(setlist[0].notes, juce::dontSendNotification);
 
-        switchView(true);
-
-        setAudioChannels(0, 2);
+        switchView(0); // Default to stage view
         startTimerHz(30);
     }
 
     ~MainComponent() override {
-        // Ensure data is saved if we quit before the debounce timer finishes
+        deviceManager.removeChangeListener(this);
         if (pendingSave) saveSetlistToDisk();
         shutdownAudio();
     }
 
+    // --- Audio Routing Callback ---
+    // If you select your USB Codec in the UI, this saves it to your hard drive permanently
+    void changeListenerCallback(juce::ChangeBroadcaster* source) override
+    {
+        if (source == &deviceManager)
+        {
+            if (auto xml = deviceManager.createStateXml())
+            {
+                if (auto* settings = appProperties.getUserSettings())
+                {
+                    settings->setValue("AudioDeviceState", xml.get());
+                    settings->saveIfNeeded();
+                }
+            }
+        }
+    }
+
+    //==============================================================================
+    // AUDIO THREAD
+    //==============================================================================
     void prepareToPlay(int samplesPerBlockExpected, double sampleRate) override
     {
         clickSynth.prepare(sampleRate);
@@ -375,6 +406,9 @@ public:
 
     void releaseResources() override {}
 
+    //==============================================================================
+    // UI THREAD
+    //==============================================================================
     void paint(juce::Graphics& g) override
     {
         g.fillAll(juce::Colour(0xff1e1e1e));
@@ -387,13 +421,16 @@ public:
         auto bounds = getLocalBounds();
 
         auto navArea = bounds.removeFromTop(50).reduced(10, 5);
-        navStageBtn.setBounds(navArea.removeFromLeft(150));
+        int navWidth = 150;
+        navStageBtn.setBounds(navArea.removeFromLeft(navWidth));
         navArea.removeFromLeft(10);
-        navEditBtn.setBounds(navArea.removeFromLeft(150));
+        navEditBtn.setBounds(navArea.removeFromLeft(navWidth));
+        navArea.removeFromLeft(10);
+        navSettingsBtn.setBounds(navArea.removeFromLeft(navWidth));
 
         bounds.reduce(20, 10);
 
-        if (isStageView)
+        if (currentView == 0) // Stage View
         {
             auto leftHalf = bounds.removeFromLeft(bounds.getWidth() / 2 - 10);
             stageViewport.setBounds(leftHalf);
@@ -407,7 +444,7 @@ public:
             }
             stageListContainer.setBounds(0, 0, leftHalf.getWidth() - 20, y);
         }
-        else
+        else if (currentView == 1) // Editor View
         {
             addSongBtn.setBounds(bounds.removeFromTop(40).removeFromLeft(200));
             bounds.removeFromTop(10);
@@ -421,11 +458,15 @@ public:
             }
             editListContainer.setBounds(0, 0, bounds.getWidth() - 20, y);
         }
+        else if (currentView == 2) // Settings View
+        {
+            // Center the audio setup box
+            audioSetupComp->setBounds(bounds.withSizeKeepingCentre(600, 400));
+        }
     }
 
     void timerCallback() override
     {
-        // 1. Check for audio pulses
         int flag = uiPulseFlag.exchange(0);
         if (flag > 0) visualPulseIntensity = 1.0f;
 
@@ -438,7 +479,6 @@ public:
             }
         }
 
-        // 2. Process Background Save Queue (Debouncing)
         if (pendingSave)
         {
             saveCountdown--;
@@ -454,7 +494,7 @@ private:
     void triggerSave()
     {
         pendingSave = true;
-        saveCountdown = 30; // Wait 1 second (at 30 FPS) before hitting the hard drive
+        saveCountdown = 30;
     }
 
     void saveSetlistToDisk()
@@ -477,20 +517,25 @@ private:
         btn.setColour(juce::TextButton::textColourOffId, isActive ? juce::Colour(0xffff7b00) : juce::Colours::grey);
     }
 
-    void switchView(bool toStage)
+    void switchView(int viewIndex)
     {
-        isStageView = toStage;
-        styleNavBtn(navStageBtn, isStageView);
-        styleNavBtn(navEditBtn, !isStageView);
+        currentView = viewIndex;
+        styleNavBtn(navStageBtn, currentView == 0);
+        styleNavBtn(navEditBtn, currentView == 1);
+        styleNavBtn(navSettingsBtn, currentView == 2);
 
-        stageViewport.setVisible(isStageView);
-        notesDisplay.setVisible(isStageView);
+        stageViewport.setVisible(currentView == 0);
+        notesDisplay.setVisible(currentView == 0);
 
-        editViewport.setVisible(!isStageView);
-        addSongBtn.setVisible(!isStageView);
+        editViewport.setVisible(currentView == 1);
+        addSongBtn.setVisible(currentView == 1);
 
-        if (isStageView) rebuildStage();
-        else rebuildEditor();
+        audioSetupComp->setVisible(currentView == 2);
+
+        if (currentView == 0) rebuildStage();
+        else if (currentView == 1) rebuildEditor();
+
+        resized();
     }
 
     void rebuildStage()
@@ -516,11 +561,9 @@ private:
         editorRows.clear();
         for (int i = 0; i < setlist.size(); ++i)
         {
-            // Pass the triggerSave lambda to the row so it alerts us when you edit a title/bpm/color
             auto* row = new EditorRow(setlist[i],
-            [this, i]() { // ON DELETE
+            [this, i]() {
                 setlist.erase(setlist.begin() + i);
-
                 if (activeSongIndex == i) {
                     atomicIsPlaying.store(false);
                     activeSongIndex = 0;
@@ -530,7 +573,7 @@ private:
                 triggerSave();
                 rebuildEditor();
             },
-            [this]() { // ON EDIT
+            [this]() {
                 triggerSave();
             });
 
@@ -567,14 +610,15 @@ private:
     }
 
     std::vector<Song> setlist;
-    bool isStageView = true;
+    int currentView = 0; // 0=Stage, 1=Edit, 2=Settings
     int activeSongIndex = -1;
 
     juce::ApplicationProperties appProperties;
     bool pendingSave = false;
     int saveCountdown = 0;
 
-    juce::TextButton navStageBtn, navEditBtn;
+    juce::TextButton navStageBtn, navEditBtn, navSettingsBtn;
+    std::unique_ptr<juce::AudioDeviceSelectorComponent> audioSetupComp;
 
     juce::Viewport stageViewport;
     juce::Component stageListContainer;
