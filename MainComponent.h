@@ -5,7 +5,7 @@
 #include <vector>
 
 //==============================================================================
-// 1. Data Model
+// 1. Data Model (Now with XML Serialization for saving/loading)
 //==============================================================================
 struct Song
 {
@@ -14,6 +14,32 @@ struct Song
     int ts { 4 };
     juce::String notes { "Intro: \nVerse: \nChorus: " };
     juce::Colour color { 0xffff7b00 };
+
+    // Convert Song to XML
+    juce::XmlElement* toXml() const
+    {
+        auto* xml = new juce::XmlElement("SONG");
+        xml->setAttribute("title", title);
+        xml->setAttribute("bpm", bpm);
+        xml->setAttribute("ts", ts);
+        xml->setAttribute("notes", notes);
+        xml->setAttribute("color", color.toString());
+        return xml;
+    }
+
+    // Create Song from XML
+    static Song fromXml(juce::XmlElement* xml)
+    {
+        Song s;
+        if (xml != nullptr) {
+            s.title = xml->getStringAttribute("title", "New Song");
+            s.bpm = xml->getDoubleAttribute("bpm", 120.0);
+            s.ts = xml->getIntAttribute("ts", 4);
+            s.notes = xml->getStringAttribute("notes", "");
+            s.color = juce::Colour::fromString(xml->getStringAttribute("color", "ffff7b00"));
+        }
+        return s;
+    }
 };
 
 //==============================================================================
@@ -84,15 +110,14 @@ public:
         }
 
         g.setColour(juce::Colours::white);
-        // +20% Font Size for Title (Was 20.0f)
         g.setFont(juce::Font(24.0f, juce::Font::bold));
         g.drawText(song.title, getLocalBounds().reduced(15, 10).removeFromTop(30), juce::Justification::centredLeft);
 
         g.setColour(juce::Colours::grey);
-        // +21% Font Size for Meta Text (Was 14.0f)
         g.setFont(17.0f);
-        g.drawText(juce::String(song.bpm) + " BPM  •  " + juce::String(song.ts) + "/4",
+        g.drawText(juce::String(song.bpm) + " BPM   " + juce::String::charToString(0x2022) + "   " + juce::String(song.ts) + "/4",
                    getLocalBounds().reduced(15, 10).removeFromBottom(25), juce::Justification::centredLeft);
+
     }
 
     void mouseDown(const juce::MouseEvent&) override { onClick(index); }
@@ -112,7 +137,9 @@ private:
 class EditorRow : public juce::Component
 {
 public:
-    EditorRow(Song& s, std::function<void()> onDel) : song(s), onDelete(std::move(onDel))
+    // Added an onEdit callback so we know when to trigger a hard drive save
+    EditorRow(Song& s, std::function<void()> onDel, std::function<void()> onEdit)
+        : song(s), onDelete(std::move(onDel)), onDataChanged(std::move(onEdit))
     {
         setupEditor(titleEd, song.title);
         setupEditor(bpmEd, juce::String(song.bpm));
@@ -162,6 +189,8 @@ public:
 private:
     Song& song;
     std::function<void()> onDelete;
+    std::function<void()> onDataChanged;
+
     juce::TextEditor titleEd, bpmEd, tsEd;
     juce::ComboBox colorPicker;
     juce::TextButton delBtn;
@@ -170,7 +199,7 @@ private:
     {
         addAndMakeVisible(ed);
         ed.setText(text, juce::dontSendNotification);
-        ed.setFont(juce::Font(18.0f)); // Forced larger explicit font for editors
+        ed.setFont(juce::Font(18.0f));
         ed.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xff1e1e1e));
         ed.setColour(juce::TextEditor::textColourId, juce::Colours::white);
         ed.setColour(juce::TextEditor::focusedOutlineColourId, juce::Colour(0xff555555));
@@ -194,6 +223,9 @@ private:
             case 6: song.color = juce::Colour(0xfffbc531); break;
             default: song.color = juce::Colour(0xffff7b00); break;
         }
+
+        // Notify parent to trigger a background save
+        if (onDataChanged) onDataChanged();
     }
 };
 
@@ -207,6 +239,35 @@ public:
     {
         juce::LookAndFeel::getDefaultLookAndFeel().setDefaultSansSerifTypefaceName("Roboto");
         setSize(900, 600);
+
+        // --- Setup Application Storage (Local Machine Saves) ---
+        juce::PropertiesFile::Options storageOptions;
+        storageOptions.applicationName     = "Setlist Metronome";
+        storageOptions.folderName          = "SetlistMetronome";
+        storageOptions.filenameSuffix      = ".xml";
+        storageOptions.osxLibrarySubFolder = "Application Support";
+        appProperties.setStorageParameters(storageOptions);
+
+        // --- Load Saved Data ---
+        auto* settings = appProperties.getUserSettings();
+        std::unique_ptr<juce::XmlElement> savedData(settings->getXmlValue("Setlist"));
+
+        if (savedData != nullptr && savedData->hasTagName("SETLIST"))
+        {
+            for (auto* child : savedData->getChildIterator())
+            {
+                if (child->hasTagName("SONG"))
+                    setlist.push_back(Song::fromXml(child));
+            }
+        }
+
+        // If it's a fresh install for your friend, give them the default data
+        if (setlist.empty())
+        {
+            setlist.push_back({"Opener", 120.0, 4, "Key: G\n\nIntro: G | C | Em | D\n\nVerse 1:\nKeep it driving on the floor tom.", juce::Colour(0xffff7b00)});
+            setlist.push_back({"Worship", 72.0, 4, "Key: D\n\nChorus:\nBig crash on downbeat. \nBuild dynamically into Bridge.", juce::Colour(0xff00a8ff)});
+            triggerSave();
+        }
 
         // --- Top Navigation Bar ---
         navStageBtn.setButtonText("STAGE VIEW");
@@ -231,12 +292,13 @@ public:
         notesDisplay.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xff2d2d2d));
         notesDisplay.setColour(juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
         notesDisplay.setColour(juce::TextEditor::focusedOutlineColourId, juce::Colour(0xff3e3e3e));
-        notesDisplay.setFont(juce::Font(22.0f)); // +22% Font Size for Notes (Was 18.0f)
+        notesDisplay.setFont(juce::Font(22.0f));
         addAndMakeVisible(notesDisplay);
 
         notesDisplay.onTextChange = [this] {
             if (activeSongIndex >= 0 && activeSongIndex < setlist.size()) {
                 setlist[activeSongIndex].notes = notesDisplay.getText();
+                triggerSave(); // Start debounce timer for typing
             }
         };
 
@@ -251,16 +313,14 @@ public:
         addSongBtn.setColour(juce::TextButton::textColourOffId, juce::Colour(0xffff7b00));
         addSongBtn.onClick = [this] {
             setlist.push_back({"New Song", 120.0, 4, "Notes here...", juce::Colour(0xffff7b00)});
+            triggerSave();
             rebuildEditor();
         };
         addChildComponent(addSongBtn);
 
-        // --- Initial Data ---
-        setlist.push_back({"Opener", 120.0, 4, "Key: G\n\nIntro: G | C | Em | D\n\nVerse 1:\nKeep it driving on the floor tom.", juce::Colour(0xffff7b00)});
-        setlist.push_back({"Worship", 72.0, 4, "Key: D\n\nChorus:\nBig crash on downbeat. \nBuild dynamically into Bridge.", juce::Colour(0xff00a8ff)});
-
         activeSongIndex = 0;
-        notesDisplay.setText(setlist[0].notes, juce::dontSendNotification);
+        if (!setlist.empty())
+            notesDisplay.setText(setlist[0].notes, juce::dontSendNotification);
 
         switchView(true);
 
@@ -268,7 +328,11 @@ public:
         startTimerHz(30);
     }
 
-    ~MainComponent() override { shutdownAudio(); }
+    ~MainComponent() override {
+        // Ensure data is saved if we quit before the debounce timer finishes
+        if (pendingSave) saveSetlistToDisk();
+        shutdownAudio();
+    }
 
     void prepareToPlay(int samplesPerBlockExpected, double sampleRate) override
     {
@@ -338,7 +402,6 @@ public:
             int y = 0;
             for (auto* tile : stageTiles)
             {
-                // Increased tile height to 90px to accommodate larger fonts
                 tile->setBounds(0, y, leftHalf.getWidth() - 20, 90);
                 y += 100;
             }
@@ -362,6 +425,7 @@ public:
 
     void timerCallback() override
     {
+        // 1. Check for audio pulses
         int flag = uiPulseFlag.exchange(0);
         if (flag > 0) visualPulseIntensity = 1.0f;
 
@@ -373,9 +437,39 @@ public:
                 stageTiles[activeSongIndex]->setPulse(visualPulseIntensity);
             }
         }
+
+        // 2. Process Background Save Queue (Debouncing)
+        if (pendingSave)
+        {
+            saveCountdown--;
+            if (saveCountdown <= 0)
+            {
+                saveSetlistToDisk();
+                pendingSave = false;
+            }
+        }
     }
 
 private:
+    void triggerSave()
+    {
+        pendingSave = true;
+        saveCountdown = 30; // Wait 1 second (at 30 FPS) before hitting the hard drive
+    }
+
+    void saveSetlistToDisk()
+    {
+        juce::XmlElement xml("SETLIST");
+        for (const auto& song : setlist)
+            xml.addChildElement(song.toXml());
+
+        if (auto* settings = appProperties.getUserSettings())
+        {
+            settings->setValue("Setlist", &xml);
+            settings->saveIfNeeded();
+        }
+    }
+
     void styleNavBtn(juce::TextButton& btn, bool isActive)
     {
         btn.setColour(juce::TextButton::buttonColourId, isActive ? juce::Colour(0xff3e3e3e) : juce::Colours::transparentBlack);
@@ -422,7 +516,9 @@ private:
         editorRows.clear();
         for (int i = 0; i < setlist.size(); ++i)
         {
-            auto* row = new EditorRow(setlist[i], [this, i]() {
+            // Pass the triggerSave lambda to the row so it alerts us when you edit a title/bpm/color
+            auto* row = new EditorRow(setlist[i],
+            [this, i]() { // ON DELETE
                 setlist.erase(setlist.begin() + i);
 
                 if (activeSongIndex == i) {
@@ -431,8 +527,13 @@ private:
                     if (!setlist.empty())
                         notesDisplay.setText(setlist[0].notes, juce::dontSendNotification);
                 }
+                triggerSave();
                 rebuildEditor();
+            },
+            [this]() { // ON EDIT
+                triggerSave();
             });
+
             editListContainer.addAndMakeVisible(row);
             editorRows.add(row);
         }
@@ -468,6 +569,10 @@ private:
     std::vector<Song> setlist;
     bool isStageView = true;
     int activeSongIndex = -1;
+
+    juce::ApplicationProperties appProperties;
+    bool pendingSave = false;
+    int saveCountdown = 0;
 
     juce::TextButton navStageBtn, navEditBtn;
 
